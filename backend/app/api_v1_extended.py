@@ -19,6 +19,78 @@ from app.auth import (
 api = Blueprint('api_extended', __name__, url_prefix='/api')
 
 # ============================================================================
+# 0. INCIDENT TASKS
+# ============================================================================
+
+@api.route('/incidents/<incident_id>/tasks', methods=['GET'])
+@authenticate
+def get_incident_tasks(incident_id):
+    """Get all tasks for a specific incident."""
+    try:
+        incident = db.session.query(Incident).filter(
+            (Incident.id == incident_id) | (Incident.incident_id == incident_id)
+        ).first()
+        if not incident:
+            return success_response({
+                'incident_id': incident_id,
+                'tasks': []
+            })
+        
+        tasks = db.session.query(Task).filter_by(incident_id=incident.id).all()
+        
+        return success_response({
+            'incident_id': incident.incident_id,
+            'tasks': [{
+                'id': t.id,
+                'title': t.title,
+                'description': t.description,
+                'status': t.status,
+                'assigned_to_id': t.assigned_to_id,
+                'assigned_to_name': t.assigned_to.username if t.assigned_to else None,
+                'due_at': t.due_at.isoformat() if t.due_at else None,
+                'is_overdue': t.due_at < datetime.utcnow() if t.due_at else False,
+                'created_at': t.created_at.isoformat() if t.created_at else None
+            } for t in tasks]
+        })
+    except Exception as e:
+        return error_response('InternalError', str(e), 500)
+
+@api.route('/incidents/<incident_id>/tasks', methods=['POST'])
+@authenticate
+@require_permission('incidents.edit')
+def create_incident_task(incident_id):
+    """Create a new task for an incident."""
+    try:
+        incident = db.session.query(Incident).filter(
+            (Incident.id == incident_id) | (Incident.incident_id == incident_id)
+        ).first()
+        if not incident:
+            return error_response('NotFound', 'Incident not found', 404)
+        
+        data = request.get_json()
+        
+        task = Task(
+            incident_id=incident.id,
+            title=data.get('title'),
+            description=data.get('description', ''),
+            status='open',
+            assigned_to_id=data.get('assigned_to_id'),
+            due_at=datetime.fromisoformat(data['due_at']) if data.get('due_at') else None
+        )
+        
+        db.session.add(task)
+        db.session.commit()
+        
+        return success_response({
+            'id': task.id,
+            'title': task.title,
+            'status': task.status
+        }, 'Task created', 201)
+    except Exception as e:
+        db.session.rollback()
+        return error_response('InternalError', str(e), 500)
+
+# ============================================================================
 # 1. DATA SOURCE METRICS
 # ============================================================================
 
@@ -96,7 +168,95 @@ def create_log_source():
         return error_response('InternalError', str(e), 500)
 
 # ============================================================================
-# 3. JIT SESSION ACTIONS
+# 3. THREAT INTELLIGENCE FEEDS
+# ============================================================================
+
+@api.route('/threat-intelligence/feeds', methods=['GET'])
+@authenticate
+def list_threat_intelligence_feeds():
+    """List all threat intelligence feeds with sync status."""
+    try:
+        feeds = db.session.query(ThreatIntelligenceFeed).all()
+        
+        return success_response({
+            'items': [{
+                'id': f.id,
+                'feed_id': f.feed_id,
+                'name': f.name,
+                'description': f.description,
+                'status': f.status,
+                'last_sync': f.last_sync.isoformat() if f.last_sync else None,
+                'sync_interval_hours': f.sync_interval_hours,
+                'indicators_count': f.indicators_count,
+                'sync_latency_minutes': (datetime.utcnow() - f.last_sync).total_seconds() / 60 if f.last_sync else None,
+                'last_error': f.last_error if f.status == 'failing' else None
+            } for f in feeds],
+            'total_feeds': len(feeds),
+            'active_feeds': sum(1 for f in feeds if f.status == 'active'),
+            'total_indicators': sum(f.indicators_count for f in feeds),
+            'timestamp': datetime.utcnow().isoformat()
+        })
+    except Exception as e:
+        return error_response('InternalError', str(e), 500)
+
+@api.route('/threat-intelligence/feeds', methods=['POST'])
+@authenticate
+@require_permission('settings.write')
+def create_threat_intelligence_feed():
+    """Create a new threat intelligence feed."""
+    try:
+        data = request.get_json()
+        
+        feed = ThreatIntelligenceFeed(
+            feed_id=f"FEED-{uuid.uuid4().hex[:8].upper()}",
+            name=data.get('name'),
+            description=data.get('description', ''),
+            status='active',
+            feed_url=data.get('feed_url'),
+            sync_interval_hours=data.get('sync_interval_hours', 24)
+        )
+        
+        db.session.add(feed)
+        db.session.commit()
+        
+        return success_response({
+            'id': feed.id,
+            'feed_id': feed.feed_id,
+            'name': feed.name
+        }, 'Feed created', 201)
+    except Exception as e:
+        db.session.rollback()
+        return error_response('InternalError', str(e), 500)
+
+@api.route('/threat-intelligence/feeds/<feed_id>/sync', methods=['POST'])
+@authenticate
+@require_permission('settings.write')
+def sync_threat_intelligence_feed(feed_id):
+    """Trigger a sync for a threat intelligence feed."""
+    try:
+        feed = db.session.query(ThreatIntelligenceFeed).filter(
+            (ThreatIntelligenceFeed.id == feed_id) | (ThreatIntelligenceFeed.feed_id == feed_id)
+        ).first()
+        if not feed:
+            return error_response('NotFound', 'Feed not found', 404)
+        
+        feed.last_sync = datetime.utcnow()
+        feed.status = 'active'
+        feed.last_error = None
+        
+        db.session.commit()
+        
+        return success_response({
+            'feed_id': feed.feed_id,
+            'last_sync': feed.last_sync.isoformat(),
+            'status': feed.status
+        }, 'Feed sync initiated', 202)
+    except Exception as e:
+        db.session.rollback()
+        return error_response('InternalError', str(e), 500)
+
+# ============================================================================
+# 4. JIT SESSION ACTIONS
 # ============================================================================
 
 @api.route('/access/jit-sessions/<session_id>/approve', methods=['POST'])

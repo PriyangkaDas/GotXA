@@ -605,7 +605,7 @@ def handle_saved_views():
 def scada_gateway_proxy(subpath):
     """Proxy SCADA gateway endpoints (machines, alarms, audit, commands) to ot-scada-gateway."""
     import requests
-    target_path = '/health' if subpath == 'health' else f'/api/scada/{subpath}'
+    target_path = '/health' if subpath in ('health', 'gateway/status', 'status') else f'/api/scada/{subpath}'
     target_url = f"http://ot-scada-gateway:5002{target_path}"
     try:
         req_headers = {k: v for k, v in request.headers if k.lower() not in ('host', 'content-length')}
@@ -620,7 +620,10 @@ def scada_gateway_proxy(subpath):
             json=req_json,
             timeout=5
         )
-        return jsonify(resp.json()), resp.status_code
+        try:
+            return jsonify(resp.json()), resp.status_code
+        except Exception:
+            return jsonify({'status': 'healthy' if resp.status_code == 200 else 'degraded', 'service': 'scada-gateway'}), resp.status_code
     except Exception as e:
         if 'alarms' in subpath:
             return jsonify({'items': []}), 200
@@ -632,6 +635,12 @@ def scada_gateway_proxy(subpath):
                     {'id': 'refinery-1', 'name': 'Refinery Unit 1 (Heater)', 'status': 'offline', 'error': str(e)},
                     {'id': 'refinery-2', 'name': 'Refinery Unit 2 (Flow)', 'status': 'offline', 'error': str(e)}
                 ]
+            }), 200
+        elif 'gateway' in subpath or subpath in ('health', 'status'):
+            return jsonify({
+                'status': 'offline',
+                'service': 'scada-gateway',
+                'error': str(e)
             }), 200
         return jsonify({'error': f'SCADA gateway service unavailable: {e}'}), 503
 

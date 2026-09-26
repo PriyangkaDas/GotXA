@@ -158,7 +158,42 @@ def process_event_batch(events):
                 source = db.session.query(LogSource).filter_by(name=host_str).first()
                 if source:
                     source.status = 'stopped'
+                
+                # Dedicated layman-understandable Alert for machine shutdown
+                clean_host = host_str.replace('ot-plc-', '').replace('ot-', '').replace('-', ' ').title()
+                db.session.add(Alert(
+                    id=str(uuid.uuid4()),
+                    alert_id=f"ALERT-STOP-{uuid.uuid4().hex[:6].upper()}",
+                    title=f"[MACHINE STOPPED] {clean_host} Turned Off (Emergency Stop Activated)",
+                    severity='critical',
+                    status='open',
+                    source=host_str,
+                    rule_id='RULE-EMERGENCY-STOP',
+                    timestamp=occurred_at,
+                    raw_event=event
+                ))
             elif is_reset:
+                if device:
+                    meta = dict(device.metadata_json or {})
+                    meta['operational_status'] = 'online'
+                    meta['emergency_stopped'] = False
+                    device.metadata_json = meta
+                source = db.session.query(LogSource).filter_by(name=host_str).first()
+                if source:
+                    source.status = 'healthy'
+                
+                clean_host = host_str.replace('ot-plc-', '').replace('ot-', '').replace('-', ' ').title()
+                db.session.add(Alert(
+                    id=str(uuid.uuid4()),
+                    alert_id=f"ALERT-RUN-{uuid.uuid4().hex[:6].upper()}",
+                    title=f"[MACHINE RESUMED] {clean_host} Online (Emergency Stop Cleared)",
+                    severity='info',
+                    status='open',
+                    source=host_str,
+                    rule_id='RULE-MACHINE-RESUMED',
+                    timestamp=occurred_at,
+                    raw_event=event
+                ))
                 if device:
                     meta = dict(device.metadata_json or {})
                     meta['operational_status'] = 'online'
@@ -304,7 +339,11 @@ def _evaluate_cross_boundary_correlation():
         # Trigger Multi-Stage Correlation if all 3 domains have suspicious activities
         if stage1_events and stage2_events and stage3_events:
             rule_id = 'CORR-MULTI-STAGE-ICS-ATTACK'
-            existing_corr = db.session.query(Alert).filter_by(rule_id=rule_id, status='open').first()
+            # Debounce: avoid spamming duplicates every 2s; limit to once per 15m window
+            existing_corr = db.session.query(Alert).filter(
+                Alert.rule_id == rule_id,
+                Alert.timestamp >= (datetime.utcnow() - timedelta(minutes=15))
+            ).first()
             if not existing_corr:
                 corr_id = f"CORR-ICS-{uuid.uuid4().hex[:6].upper()}"
                 s1 = stage1_events[-1]
@@ -340,7 +379,7 @@ def _evaluate_cross_boundary_correlation():
                 corr_alert = Alert(
                     id=str(uuid.uuid4()),
                     alert_id=corr_id,
-                    title="[CORRELATION CRITICAL] Multi-Stage Cyber-Physical Attack: Credential Compromise -> SCADA Setpoint Manipulation -> PLC Process Impairment",
+                    title=f"[CYBER-PHYSICAL ATTACK] {s3.raw_event.get('dest_asset', 'Refinery 1').replace('PLC_', '').replace('_', ' ').title()}: {s3.message or 'Process Setpoint Altered via Unauthorized Modbus'}",
                     severity='critical',
                     status='open',
                     source='SIEM_Correlation_Engine',
