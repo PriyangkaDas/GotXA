@@ -304,6 +304,7 @@ def delete_row(table_name):
         return error_response('DatabaseError', str(e), 400)
 
 @api.route('/batch-operations', methods=['POST'])
+@api.route('/batch-query', methods=['POST'])
 @authenticate
 def execute_batch_operations():
     """Execute a set of safe database operations inside one API call."""
