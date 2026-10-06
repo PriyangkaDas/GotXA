@@ -1,182 +1,469 @@
-version: '3.9'
-
 services:
-  # =========================================================================
-  # SECURITY LAYER (172.23.0.0/16)
-  # Central SIEM, database, and log collection
-  # =========================================================================
+ 
+
+  # CACHE & MESSAGE BROKER
+ 
+
+  
+  redis:
+    image: redis:7-alpine
+    container_name: radisCache
+    networks:
+      - gotxa-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    expose:
+      - "6379"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+
+ 
+
+  # DATABASES
+ 
+
   
   siem-postgres:
     image: postgres:15-alpine
-    container_name: siem-postgres
+    container_name: Database
     environment:
-      POSTGRES_DB: siem_db
-      POSTGRES_USER: siem_user
-      POSTGRES_PASSWORD: siem_password
+      POSTGRES_USER: ${POSTGRES_USER:-siem_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-siem_db}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - siem-db-data:/var/lib/postgresql/data
     networks:
-      - security-control
+      - gotxa-net
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U siem_user -d siem_db"]
       interval: 10s
       timeout: 5s
       retries: 5
-    restart: unless-stopped
-
-  siem-soar-server:
-    build:
-      context: .
-      dockerfile: Dockerfile.siem
-    container_name: siem-soar-server
     ports:
-      - "5000:5000"
+      - "5432:5432"
+    command:
+      - "-c"
+      - "max_wal_size=2GB"
+      - "-c"
+      - "shared_buffers=256MB"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+
+ 
+
+  # BACKEND API SERVER
+ 
+
+  
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: SoC
     environment:
-      DATABASE_URL: postgresql://siem_user:siem_password@siem-postgres:5432/siem_db
-      SOAR_REAL_MODE: "true"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-      - ./frontend:/app/frontend
-      - logs_shared:/logs
-    cap_add:
-      - NET_ADMIN
-    networks:
-      - security-control
-      - corporate-net
-      - operational-net
+      TZ: ${TZ:-Asia/Kolkata}
+      SIEM_TZ_OFFSET_MINUTES: "330"
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      FLASK_ENV: production
+      DEBUG: 'False'
+      LOG_LEVEL: INFO
+      REPORTS_DIR: /app/reports
+      COLLECTOR_INGEST_TOKEN: ${COLLECTOR_INGEST_TOKEN:?Set COLLECTOR_INGEST_TOKEN in .env}
+      SOAR_REAL_MODE: ${SOAR_REAL_MODE:-false}
     depends_on:
       siem-postgres:
         condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - gotxa-net
+    cap_add:
+      - NET_ADMIN
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./backend:/app
+      - reports-data:/app/reports
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1.5G
+        reservations:
+          cpus: '1'
+          memory: 1G
+  
 
-  log-collector-dedicated:
+  # CELERY WORKER (Background Tasks & Report Generation)
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.celery
+    container_name: celery-worker
+    environment:
+      TZ: ${TZ:-Asia/Kolkata}
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      FLASK_ENV: production
+      LOG_LEVEL: INFO
+      REPORTS_DIR: /app/reports
+    depends_on:
+      siem-postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    networks:
+      - gotxa-net
+    volumes:
+      - ./backend:/app
+      - reports-data:/app/reports
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1.5'
+          memory: 1G
+        reservations:
+          cpus: '0.75'
+          memory: 512M
+
+  log-collector:
     build:
       context: .
       dockerfile: Dockerfile.collector
-    container_name: log-collector-dedicated
-    ports:
-      - "5005:5001"
-    volumes:
-      - logs_shared:/logs
-    networks:
-      - security-control
-      - corporate-net
-      - operational-net
-    depends_on:
-      - siem-soar-server
-    restart: unless-stopped
-
-  # =========================================================================
-  # CORPORATE NETWORK (172.24.0.0/16)
-  # Vulnerable app for testing + passive infrastructure
-  # =========================================================================
-  
-  corp-portal-agent:
-    build:
-      context: .
-      dockerfile: Dockerfile.vulnerable
-    container_name: corp-portal-agent
-    ports:
-      - "5001:5001"
-    volumes:
-      - ./frontend:/app/frontend
-      - logs_shared:/logs
-    networks:
-      - corporate-net
-    restart: unless-stopped
-
-  corp-database-agent:
-    image: postgres:15-alpine
-    container_name: corp-database-agent
+    container_name: gotxa-log-collector
     environment:
-      POSTGRES_DB: corp_db
-      POSTGRES_USER: corp_user
-      POSTGRES_PASSWORD: corp_password
-    networks:
-      - corporate-net
-    restart: unless-stopped
-
-  # =========================================================================
-  # OT/SCADA NETWORK (172.25.0.0/16)
-  # Simulated operational technology agents with Modbus
-  # =========================================================================
-  
-  ot-scada-gateway:
-    build:
-      context: .
-      dockerfile: Dockerfile.scada
-    container_name: ot-scada-gateway
-    ports:
-      - "5002:5002"
-    environment:
-      FLASK_ENV: production
+      TZ: ${TZ:-Asia/Kolkata}
+      SIEM_INGRESS_URL: http://backend:5000/api/ingest/events
+      COLLECTOR_INGEST_TOKEN: ${COLLECTOR_INGEST_TOKEN:?Set COLLECTOR_INGEST_TOKEN in .env}
+      COLLECTOR_PORT: "5006"
     volumes:
-      - logs_shared:/logs
-    networks:
-      - operational-net
-      - security-control
+      - ./logs:/logs:ro
     depends_on:
-      - ot-plc-refinery-1
-      - ot-plc-refinery-2
+      backend:
+        condition: service_healthy
+    networks:
+      - gotxa-net
+    expose:
+      - "5006"
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
 
   ot-plc-refinery-1:
     build:
       context: .
-      dockerfile: Dockerfile.agent
+      dockerfile: Dockerfile.plc
     container_name: ot-plc-refinery-1
-    ports:
-      - "5003:5003"
     environment:
+      TZ: ${TZ:-Asia/Kolkata}
       AGENT_NAME: ot-plc-refinery-1
-    volumes:
-      - logs_shared:/logs
+      MODBUS_PORT: "5003"
     networks:
-      - operational-net
+      - gotxa-net
+    volumes:
+      - ./logs:/logs
+    expose:
+      - "5003"
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
 
   ot-plc-refinery-2:
     build:
       context: .
-      dockerfile: Dockerfile.agent
+      dockerfile: Dockerfile.plc
     container_name: ot-plc-refinery-2
-    ports:
-      - "5004:5004"
     environment:
+      TZ: ${TZ:-Asia/Kolkata}
       AGENT_NAME: ot-plc-refinery-2
-    volumes:
-      - logs_shared:/logs
+      MODBUS_PORT: "5004"
     networks:
-      - operational-net
+      - gotxa-net
+    volumes:
+      - ./logs:/logs
+    expose:
+      - "5004"
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.25'
+          memory: 128M
 
-# ============================================================================
-# NETWORKS (3 Isolated Networks)
-# ============================================================================
-networks:
-  security-control:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.23.0.0/16
+  scada-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.scada
+    container_name: ot-scada-gateway
+    environment:
+      TZ: ${TZ:-Asia/Kolkata}
+      SIEM_INGRESS_URL: http://backend:5000/api/ingest/events
+      SIEM_INGEST_URL: http://backend:5000/api/ingest/events
+      COLLECTOR_INGEST_TOKEN: ${COLLECTOR_INGEST_TOKEN:?Set COLLECTOR_INGEST_TOKEN in .env}
+      PLC_REFINERY_1_HOST: ${PLC_REFINERY_1_HOST:-ot-plc-refinery-1}
+      PLC_REFINERY_2_HOST: ${PLC_REFINERY_2_HOST:-ot-plc-refinery-2}
+    depends_on:
+      backend:
+        condition: service_healthy
+      ot-plc-refinery-1:
+        condition: service_started
+      ot-plc-refinery-2:
+        condition: service_started
+    networks:
+      - gotxa-net
+    volumes:
+      - ./logs:/logs
+    expose:
+      - "5002"
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.75'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
 
-  corporate-net:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.24.0.0/16
 
-  operational-net:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.25.0.0/16
+ 
+
+  # FRONTEND WEB SERVERS
+
+  siem-soar-frontend:
+    build:
+      context: .
+      dockerfile: webservers/siem-soar-frontend/Dockerfile
+    container_name: siem-soar-frontend
+    networks:
+      - gotxa-net
+    depends_on:
+      - backend
+    volumes:
+      - siem-frontend-data:/app/frontend
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    expose:
+      - "80"
+    deploy:
+      resources:
+        limits:
+          cpus: '0.75'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+
+  corp-portal-frontend:
+    build:
+      context: .
+      dockerfile: webservers/corp-portal-frontend/Dockerfile
+    container_name: corp-portal-frontend
+    networks:
+      - gotxa-net
+    depends_on:
+      - backend
+    volumes:
+      - corp-frontend-data:/app/frontend
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    expose:
+      - "80"
+    deploy:
+      resources:
+        limits:
+          cpus: '0.75'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+
+  scada-frontend:
+    build:
+      context: .
+      dockerfile: webservers/scada-frontend/Dockerfile
+    container_name: scada-frontend
+    networks:
+      - gotxa-net
+    depends_on:
+      - backend
+    volumes:
+      - scada-frontend-data:/app/frontend
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    expose:
+      - "80"
+    deploy:
+      resources:
+        limits:
+          cpus: '0.75'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+
+ 
+
+  # API GATEWAY / REVERSE PROXY
+ 
+
+  
+  api-gateway:
+    build:
+      context: .
+      dockerfile: webservers/api-gateway/Dockerfile
+    container_name: Frontend
+    networks:
+      - gotxa-net
+    depends_on:
+      - backend
+      - siem-soar-frontend
+      - corp-portal-frontend
+      - scada-frontend
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - TZ=Asia/Kolkata
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+
+
+ 
+
+  # RED TEAM / PENETRATION TESTING MACHINE
+ 
+
+
+  new-machine:
+    build:
+      context: ./New_Machine
+      dockerfile: Dockerfile
+    container_name: New_Machine
+    stdin_open: true
+    tty: true
+    networks:
+      - gotxa-net
+    depends_on:
+      - backend
+      - siem-postgres
+      - api-gateway
+    environment:
+      TZ: ${TZ:-Asia/Kolkata}
+    volumes:
+      - ./New_Machine:/workspace
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_ADMIN
+    command: /bin/bash
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
 
 # ============================================================================
 # VOLUMES
 # ============================================================================
+
 volumes:
-  postgres_data:
+  siem-db-data:
     driver: local
-  logs_shared:
+  siem-frontend-data:
     driver: local
+  corp-frontend-data:
+    driver: local
+  scada-frontend-data:
+    driver: local
+  reports-data:
+    driver: local
+
+# ============================================================================
+# NETWORKS
+# ============================================================================
+
+networks:
+  gotxa-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.26.0.0/16

@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.env
+backend/.env
+.venv/
+.pytest_cache/
+*.log
+
+COMPLETE_SIEM_SOAR_TEST_RESULTS.md
+SIEM_SOAR_DEMO_SUMMARY.md
+SIEM_SOAR_FUNCTIONAL_TEST_REPORT.md

@@ -1,8 +1,10 @@
+import os
 import time
 import requests
 
 # Operational Endpoint Configuration
-TARGET_URL = "http://localhost:5001/login"
+BASE_URL = os.getenv("TARGET_HOST", "http://localhost:5000")
+TARGET_URL = os.getenv("TARGET_URL", f"{BASE_URL}/login")
 
 def run_service_log_test():
     """
@@ -14,7 +16,7 @@ def run_service_log_test():
     # Standard operational test cases (e.g., malformed content types, bad routes)
     test_cases = [
         {"desc": "Testing missing input parameters", "data": {}},
-        {"desc": "Testing invalid endpoint path", "url": "http://localhost:5001/invalid_route"},
+        {"desc": "Testing invalid endpoint path", "url": f"{BASE_URL}/invalid_route"},
     ]
     
     for case in test_cases:

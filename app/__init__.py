@@ -1,1 +1,0 @@
-"""SIEM/SOAR Application Package"""
